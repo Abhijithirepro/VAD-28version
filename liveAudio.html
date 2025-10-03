@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio VAD Processor</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: black;
+            color: white;
+            min-height: 100vh;
+        }
+        
+        .container {
+            text-align: center;
+        }
+        
+        .status {
+            margin: 20px 0;
+        }
+        
+        .indicator {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+            font-weight: bold;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .indicator.speaking {
+            background: rgba(76, 175, 80, 0.3);
+            color: #4CAF50;
+        }
+        
+        .indicator.not-speaking {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+        
+        .indicator.error {
+            background: rgba(244, 67, 54, 0.3);
+            color: #f44336;
+        }
+        
+        button {
+            background: #2196F3;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px;
+        }
+        
+        button:hover:not(:disabled) {
+            background: #1976D2;
+        }
+        
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        
+        #stats {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        
+        .audio-list {
+            margin-top: 30px;
+        }
+        
+        .audio-item {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .audio-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .download-btn {
+            background: #4CAF50;
+            padding: 8px 16px;
+            font-size: 14px;
+        }
+        
+        .download-btn:hover {
+            background: #45a049;
+        }
+        
+        audio {
+            height: 35px;
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
+    <script>
+        // FORCE CPU-ONLY MODE - Prevent GPU detection completely
+        ort.env.wasm.numThreads = 1;
+        ort.env.wasm.simd = false;
+        ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+        
+        // Override GPU context creation to prevent WebGPU initialization
+        if (typeof navigator !== 'undefined' && navigator.gpu) {
+            Object.defineProperty(navigator, 'gpu', {
+                get: () => undefined,
+                configurable: true
+            });
+        }
+        
+        // Set log level to fatal to suppress warnings
+        ort.env.logLevel = 'fatal';
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.28/dist/bundle.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 Audio VAD Detector</h1>
+        <div class="status">
+            <div id="indicator" class="indicator">Loading VAD...</div>
+            <button id="toggleBtn" onclick="toggleVAD()" disabled>Start Listening</button>
+        </div>
+
+        <div id="stats">
+            <p><strong>Speech Segments Captured:</strong> <span id="segmentCount">0</span></p>
+            <p><strong>Total Audio Duration:</strong> <span id="totalDuration">0</span> seconds</p>
+        </div>
+
+        <div class="audio-list">
+            <h3>📋 Captured Speech Segments</h3>
+            <div id="audioList"></div>
+        </div>
+    </div>
+    <script>
+        let myvad = null;
+        let isListening = false;
+        let segment = 0;
+        let totalDuration = 0;
+
+        async function initVAD() {
+            try{
+                
+                myvad = await vad.MicVAD.new({
+                    model: "v5",
+                    positiveSpeechThreshold: 0.6,
+                    negativeSpeechThreshold: 0.35,  // Must be less than positiveSpeechThreshold
+                    minSpeechFrames: 10,
+                    preSpeechPadFrames: 20,
+
+                    // Called for each audio frame
+                    onFrameProcessed: (probabilities, frame) => {
+                        updateSpeechIndicator(probabilities.isSpeech > 0.6);
+                    },
+
+                    // Called when speech starts
+                    onSpeechStart: () => {
+                        console.log("🎤 Speech started");
+                        updateIndicator("Speaking...", "speaking");
+                    },
+
+                    onSpeechEnd: (audioData) => {
+                        console.log("🔇 Speech ended", audioData);
+                        processAudioSegment(audioData);
+                        updateIndicator("Listening...", "not-speaking");
+                    },
+                    
+                    // Called for very short speech that might be noise
+                    onVADMisfire: () => {
+                        console.log("⚠️ VAD misfire (too short)");
+                    },
+                    
+                    // Asset paths for the models
+                    onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
+                    baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.28/dist/",
+                });
+
+                // VAD loaded successfully
+                document.getElementById("toggleBtn").disabled = false; 
+                updateIndicator("Ready to listen", "not-speaking");
+                document.getElementById("stats").style.display = "block";
+            } catch(error) {
+                console.error("Failed to initialize VAD:", error);
+                updateIndicator("Failed to load VAD", "error");
+            }
+        }
+
+        // Toggle VAD listening 
+        function toggleVAD() {
+            if (!myvad) return;
+            
+            if (isListening) {
+                myvad.pause();
+                isListening = false;
+                document.getElementById("toggleBtn").textContent = "Start Listening";
+                updateIndicator("Stopped", "not-speaking");
+            } else {
+                myvad.start();
+                isListening = true;
+                document.getElementById("toggleBtn").textContent = "Stop Listening";
+                updateIndicator("Listening...", "not-speaking");
+            }
+        }
+        // Update the speech indicator
+        function updateSpeechIndicator(isSpeaking) {
+            // Add visual feedback for real-time speech detection
+            const indicator = document.getElementById("indicator");
+            if (isSpeaking) {
+                indicator.style.color = "#4CAF50";
+            }
+        }
+
+        function updateIndicator(text, className) {
+            const indicator = document.getElementById("indicator");
+            indicator.textContent = text;
+            indicator.className = `indicator ${className}`;
+        }
+
+        function processAudioSegment(audioData) {
+            segment++;
+            const duration = audioData.length / 16000; // 16kHz sample rate 
+            totalDuration += duration; 
+
+            document.getElementById("segmentCount").textContent = segment;
+            document.getElementById("totalDuration").textContent = totalDuration.toFixed(2);
+
+            // Convert audio to WAV format
+            const wavBuffer = vad.utils.encodeWAV(audioData);
+            const base64 = vad.utils.arrayBufferToBase64(wavBuffer);
+            const audioUrl = `data:audio/wav;base64,${base64}`;
+
+            addAudioToList(audioUrl, duration, segment);
+            console.log(`📊 Processed segment ${segment}: ${duration.toFixed(2)}s`);
+        }
+
+        // Add audio segment to the list
+        function addAudioToList(audioUrl, duration, segmentNumber) {
+            const audioList = document.getElementById('audioList');
+            
+            const audioItem = document.createElement('div');
+            audioItem.className = 'audio-item';
+            audioItem.innerHTML = `
+                <div>
+                    <strong>Segment ${segmentNumber}</strong><br>
+                    Duration: ${duration.toFixed(2)}s
+                </div>
+                <div class="audio-controls">
+                    <audio controls>
+                        <source src="${audioUrl}" type="audio/wav">
+                    </audio>
+                    <button class="download-btn" onclick="downloadAudio('${audioUrl}', ${segmentNumber})">
+                        Download
+                    </button>
+                </div>
+            `;
+            
+            audioList.insertBefore(audioItem, audioList.firstChild);
+        }
+
+        // Download audio file
+        function downloadAudio(audioUrl, segmentNumber) {
+            const link = document.createElement('a');
+            link.href = audioUrl;
+            link.download = `speech_segment_${segmentNumber}_${Date.now()}.wav`;
+            link.click();
+        }
+
+          // Initialize when page loads
+          window.addEventListener('load', initVAD);
+    </script>    
+</body>
+</html>
+
